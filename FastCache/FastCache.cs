@@ -35,7 +35,7 @@ namespace Jitbit.Utils
             get
             {
                 long q = TotalQueries;
-                return q == 0 ? 0.0 : (double)(Hits / q) * 100;
+                return q == 0 ? 0.0 : (double)Hits * 100.0 / q;
             }
         }
 
