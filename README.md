@@ -100,12 +100,12 @@ and likely irrelevant to most.
 
 ## Tradeoffs
 
-~~FastCache uses `Environment.TickCount` to monitor items' TTL. `Environment.TickCount` is 104x times faster than using `DateTime.Now` and 26x times faster than `DateTime.UtcNow`.
+~~FastCache uses `Environment.TickCount` to monitor items' TTL. `Environment.TickCount` is 104x times faster than using `DateTime.Now` and 26x times faster than `DateTime.UtcNow`.~~
 
 ~~But `Environment.TickCount` is limited to `Int32`. Which means it resets to `int.MinValue` once overflowed. This is not a problem, we do have a workaround for that. However this means you cannot cache stuff for more than 25 days (2.4 billion milliseconds).~~
 
-The above is no longer valid, we have switched to .NET 6 targeting and now use `TickCount64` which is free of this problem.~~
+~~The above is no longer valid, we have switched to .NET 6 targeting and now use `TickCount64` which is free of this problem.~~
 
-This fork uses an equaly fast alternative that is fully .net 4.8+ compatible.
+This fork uses an equally fast alternative that is fully .net 4.8+ compatible.
 
 Another tradeoff: MemoryCache watches memory usage, and evicts items once it senses memory pressure. **FastCache does not do any of that** it is up to you to keep your caches reasonably sized. After all, it's just a dictionary.
