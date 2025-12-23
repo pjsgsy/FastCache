@@ -1,4 +1,6 @@
-# FastCache
+# FastCache  (for .NET FRAMEWORK 4.8+)
+
+This is a fork of the authors orignial work for .net 6+, backported and with some minor changes to support .NET FRAMEWORK 4.8+
 
 7x-10x faster alternative to MemoryCache. A high-performance, lighweight (8KB dll) and [thread-safe](Atomic.md) memory cache for .NET Core (.NET 6 and later)
 
