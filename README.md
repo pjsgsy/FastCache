@@ -90,8 +90,10 @@ These public properties are available
         public long Evictions { get { return Interlocked.Read(ref _evictions); } }
         public double HitRate
 
-Tracking these adds a very (very!) tiny performance hit vs the author's original work, but I always want to know what is going on, inside! Kept very simple
-and done with Interlocked.Increment, the overhead is really very minimal and likely irrelevant to most.
+Tracking these adds a very (very!) tiny performance hit vs the author's original work, but I
+always want to know what is going on, inside! 
+Kept very simple and done with Interlocked.Increment, the overhead is really very minimal
+and likely irrelevant to most.
 
 ```
 
