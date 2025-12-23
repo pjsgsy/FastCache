@@ -80,7 +80,7 @@ cache.GetOrAdd(
 	ttl: TimeSpan.FromMilliseconds(100),
 	factoryArgument: "some state data");
 
-These public properties are available
+These public properties are available (in this fork)
 
         public long TotalQueries { get { return Interlocked.Read(ref _totalQueries); } }
         public long Hits { get { return Interlocked.Read(ref _hits); } }
