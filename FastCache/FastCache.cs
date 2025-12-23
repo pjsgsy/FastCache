@@ -17,6 +17,28 @@ namespace Jitbit.Utils
     public class FastCache<TKey, TValue> :
         IEnumerable<KeyValuePair<TKey, TValue>>, IDisposable
     {
+        // ---- metrics (atomic counters) ----
+        private long _totalQueries;
+        private long _hits;
+        private long _misses;
+        private long _adds;
+        private long _updates;
+        private long _evictions;
+        public long TotalQueries { get { return Interlocked.Read(ref _totalQueries); } }
+        public long Hits { get { return Interlocked.Read(ref _hits); } }
+        public long Misses { get { return Interlocked.Read(ref _misses); } }
+        public long Adds { get { return Interlocked.Read(ref _adds); } }
+        public long Updates { get { return Interlocked.Read(ref _updates); } }
+        public long Evictions { get { return Interlocked.Read(ref _evictions); } }
+        public double HitRate
+        {
+            get
+            {
+                long q = TotalQueries;
+                return q == 0 ? 0.0 : (double)(Hits / q) * 100;
+            }
+        }
+
         private readonly ConcurrentDictionary<TKey, TtlValue> _dict =
             new ConcurrentDictionary<TKey, TtlValue>();
 
@@ -88,7 +110,11 @@ namespace Jitbit.Utils
                 Monitor.Exit(_cleanUpTimer);
             }
 
-            OnEviction(evictedKeys);
+            if (evictedKeys != null && evictedKeys.Count > 0)
+            {
+                Interlocked.Add(ref _evictions, evictedKeys.Count);
+                OnEviction(evictedKeys);
+            }
         }
 
         public int Count
@@ -105,10 +131,21 @@ namespace Jitbit.Utils
         {
             var ttlValue = new TtlValue(value, ttl);
 
+            bool added = false;
+
             _dict.AddOrUpdate(
                 key,
-                k => ttlValue,
+                k =>
+                {
+                    added = true;
+                    return ttlValue;
+                },
                 (k, old) => ttlValue);
+
+            if (added)
+                Interlocked.Increment(ref _adds);
+            else
+                Interlocked.Increment(ref _updates);
         }
 
         public void AddOrUpdate(
@@ -125,11 +162,16 @@ namespace Jitbit.Utils
 
         public bool TryGet(TKey key, out TValue value)
         {
+            Interlocked.Increment(ref _totalQueries);
+
             value = default(TValue);
 
             TtlValue ttlValue;
             if (!_dict.TryGetValue(key, out ttlValue))
+            {
+                Interlocked.Increment(ref _misses);
                 return false;
+            }
 
             if (ttlValue.IsExpired())
             {
@@ -139,11 +181,12 @@ namespace Jitbit.Utils
                 {
                     _dict.TryRemove(key, out existing);
                 }
-
+                Interlocked.Increment(ref _misses);
+                Interlocked.Increment(ref _evictions);
                 OnEviction(key);
                 return false;
             }
-
+            Interlocked.Increment(ref _hits);
             value = ttlValue.Value;
             return true;
         }
@@ -162,6 +205,8 @@ namespace Jitbit.Utils
             Func<TValue> valueFactory,
             TimeSpan ttl)
         {
+            Interlocked.Increment(ref _totalQueries);
+
             bool wasAdded = false;
 
             var ttlValue = _dict.GetOrAdd(
@@ -172,12 +217,21 @@ namespace Jitbit.Utils
                     return new TtlValue(valueFactory(), ttl);
                 });
 
-            if (!wasAdded)
+            if (wasAdded)
             {
-                if (ttlValue.ModifyIfExpired(valueFactory, ttl))
-                    OnEviction(key);
+                Interlocked.Increment(ref _adds);
+                Interlocked.Increment(ref _hits);
+                return ttlValue.Value;
             }
 
+            if (ttlValue.ModifyIfExpired(valueFactory, ttl))
+            {
+                Interlocked.Increment(ref _updates);
+                Interlocked.Increment(ref _evictions);
+                OnEviction(key);
+            }
+
+            Interlocked.Increment(ref _hits);
             return ttlValue.Value;
         }
 
