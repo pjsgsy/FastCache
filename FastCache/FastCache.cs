@@ -2,385 +2,338 @@ using System;
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace Jitbit.Utils
 {
-	internal static class FastCacheStatics
-	{
-		internal static readonly SemaphoreSlim GlobalStaticLock = new(1); //moved this static field to separate class, otherwise a static field in a generic class is not a true singleton
-	}
+    internal static class FastCacheStatics
+    {
+        internal static readonly SemaphoreSlim GlobalStaticLock =
+            new SemaphoreSlim(1, 1);
+    }
 
-	/// <summary>
-	/// faster MemoryCache alternative. basically a concurrent dictionary with expiration
-	/// </summary>
-	public class FastCache<TKey, TValue> : IEnumerable<KeyValuePair<TKey, TValue>>, IDisposable
-	{
-		private readonly ConcurrentDictionary<TKey, TtlValue> _dict = new ConcurrentDictionary<TKey, TtlValue>();
+    public class FastCache<TKey, TValue> :
+        IEnumerable<KeyValuePair<TKey, TValue>>, IDisposable
+    {
+        private readonly ConcurrentDictionary<TKey, TtlValue> _dict =
+            new ConcurrentDictionary<TKey, TtlValue>();
 
-		private readonly Timer _cleanUpTimer;
-		private readonly EvictionCallback _itemEvicted;
+        private readonly Timer _cleanUpTimer;
+        private readonly EvictionCallback _itemEvicted;
 
-		/// <summary>
-		/// Callback (RUNS ON THREAD POOL!) when an item is evicted from the cache.
-		/// </summary>
-		/// <param name="key"></param>
-		public delegate void EvictionCallback(TKey key);
+        public delegate void EvictionCallback(TKey key);
 
-		/// <summary>
-		/// Initializes a new empty instance of <see cref="FastCache{TKey,TValue}"/>
-		/// </summary>
-		/// <param name="cleanupJobInterval">cleanup interval in milliseconds, default is 10000</param>
-		/// <param name="itemEvicted">Optional callback (RUNS ON THREAD POOL!) when an item is evicted from the cache</param>
-		public FastCache(int cleanupJobInterval = 10000, EvictionCallback itemEvicted = null)
-		{
-			_itemEvicted = itemEvicted;
-			_cleanUpTimer = new Timer(s => { _ = EvictExpiredJob(); }, null, cleanupJobInterval, cleanupJobInterval);
-		}
+        public FastCache(int cleanupJobInterval = 10000,
+                         EvictionCallback itemEvicted = null)
+        {
+            _itemEvicted = itemEvicted;
+            _cleanUpTimer = new Timer(
+                s => EvictExpiredJob().ConfigureAwait(false),
+                null,
+                cleanupJobInterval,
+                cleanupJobInterval);
+        }
 
-		private async Task EvictExpiredJob()
-		{
-			//if an applicaiton has many-many instances of FastCache objects, make sure the timer-based
-			//cleanup jobs don't clash with each other, i.e. there are no clean-up jobs running in parallel
-			//so we don't waste CPU resources, because cleanup is a busy-loop that iterates a collection and does calculations
-			//so we use a lock to "throttle" the job and make it serial
-			//HOWEVER, we still allow the user to execute eviction explicitly
+        private async Task EvictExpiredJob()
+        {
+            await FastCacheStatics.GlobalStaticLock
+                .WaitAsync()
+                .ConfigureAwait(false);
 
-			//use Semaphore instead of a "lock" to free up thread, otherwise - possible thread starvation
+            try
+            {
+                EvictExpired();
+            }
+            finally
+            {
+                FastCacheStatics.GlobalStaticLock.Release();
+            }
+        }
 
-			await FastCacheStatics.GlobalStaticLock.WaitAsync()
-				.ConfigureAwait(false);
-			try
-			{
-				EvictExpired();
-			}
-			finally { FastCacheStatics.GlobalStaticLock.Release(); }
-		}
+        public void EvictExpired()
+        {
+            if (!Monitor.TryEnter(_cleanUpTimer))
+                return;
 
-		/// <summary>
-		/// Cleans up expired items (dont' wait for the background job)
-		/// There's rarely a need to execute this method, b/c getting an item checks TTL anyway.
-		/// </summary>
-		public void EvictExpired()
-		{
-			//Eviction already started by another thread? forget it, lets move on
-			if (Monitor.TryEnter(_cleanUpTimer)) //use the timer-object for our lock, it's local, private and instance-type, so its ok
-			{
-				List<TKey> evictedKeys = null; // Batch eviction callbacks
-				try
-				{
-					//cache current tick count in a var to prevent calling it every iteration inside "IsExpired()" in a tight loop.
-					//On a 10000-items cache this allows us to slice 30 microseconds: 330 vs 360 microseconds which is 10% faster
-					//On a 50000-items cache it's even more: 2.057ms vs 2.817ms which is 35% faster!!
-					//the bigger the cache the bigger the win
-					var currTime = Environment.TickCount64;
+            List<TKey> evictedKeys = null;
 
-					foreach (var p in _dict)
-					{
-						if (p.Value.IsExpired(currTime)) //call IsExpired with "currTime" to avoid calling Environment.TickCount64 multiple times
-						{
-							if (_dict.TryRemove(p) && _itemEvicted != null) // collect key for later batch processing (only if callback exists)
-							{
-								evictedKeys ??= new List<TKey>(); //lazy initialize the list
-								evictedKeys.Add(p.Key);
-							}
-						}
-					}
-				}
-				finally
-				{
-					Monitor.Exit(_cleanUpTimer);
-				}
+            try
+            {
+                long now = TimeUtil.NowMs();
 
-				// Trigger batched eviction callbacks outside the loop to prevent flooding the thread pool
-				OnEviction(evictedKeys);
-			}
-		}
+                foreach (var p in _dict)
+                {
+                    if (p.Value.IsExpired(now))
+                    {
+                        TtlValue existing;
+                        if (_dict.TryGetValue(p.Key, out existing) &&
+                            ReferenceEquals(existing, p.Value) &&
+                            _dict.TryRemove(p.Key, out existing))
+                        {
+                            if (_itemEvicted != null)
+                            {
+                                if (evictedKeys == null)
+                                    evictedKeys = new List<TKey>();
 
-		/// <summary>
-		/// Returns total count, including expired items too, if they were not yet cleaned by the eviction job
-		/// </summary>
-		public int Count => _dict.Count;
+                                evictedKeys.Add(p.Key);
+                            }
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                Monitor.Exit(_cleanUpTimer);
+            }
 
-		/// <summary>
-		/// Removes all items from the cache
-		/// </summary>
-		public void Clear() => _dict.Clear();
+            OnEviction(evictedKeys);
+        }
 
-		/// <summary>
-		/// Adds an item to cache if it does not exist, updates the existing item otherwise. Updating an item resets its TTL, essentially "sliding expiration".
-		/// </summary>
-		/// <param name="key">The key to add</param>
-		/// <param name="value">The value to add</param>
-		/// <param name="ttl">TTL of the item</param>
-		public void AddOrUpdate(TKey key, TValue value, TimeSpan ttl)
-		{
-			var ttlValue = new TtlValue(value, ttl);
+        public int Count
+        {
+            get { return _dict.Count; }
+        }
 
-			_dict.AddOrUpdate(key, static (_, c) => c, static (_, _, c) => c, ttlValue);
-		}
+        public void Clear()
+        {
+            _dict.Clear();
+        }
 
-		/// <summary>
-		/// Factory pattern overload. Adds an item to cache if it does not exist, updates the existing item otherwise. Updating an item resets its TTL, essentially "sliding expiration".
-		/// </summary>
-		/// <param name="key">The key to add or update</param>
-		/// <param name="addValueFactory">The factory function used to generate the item for the key</param>
-		/// <param name="updateValueFactory">The factory function used to update the item for the key</param>
-		/// <param name="ttl">TTL of the item</param>
-		public void AddOrUpdate(TKey key, Func<TKey, TValue> addValueFactory, Func<TKey, TValue, TValue> updateValueFactory, TimeSpan ttl)
-		{
-			_dict.AddOrUpdate(key,
-				addValueFactory: k => new TtlValue(addValueFactory(k), ttl),
-				updateValueFactory: (k, v) => new TtlValue(updateValueFactory(k, v.Value), ttl));
-		}
+        public void AddOrUpdate(TKey key, TValue value, TimeSpan ttl)
+        {
+            var ttlValue = new TtlValue(value, ttl);
 
-		/// <summary>
-		/// Attempts to get a value by key
-		/// </summary>
-		/// <param name="key">The key to get</param>
-		/// <param name="value">When method returns, contains the object with the key if found, otherwise default value of the type</param>
-		/// <returns>True if value exists, otherwise false</returns>
-		public bool TryGet(TKey key, out TValue value)
-		{
-			value = default(TValue);
+            _dict.AddOrUpdate(
+                key,
+                k => ttlValue,
+                (k, old) => ttlValue);
+        }
 
-			if (!_dict.TryGetValue(key, out TtlValue ttlValue))
-				return false; //not found
+        public void AddOrUpdate(
+            TKey key,
+            Func<TKey, TValue> addValueFactory,
+            Func<TKey, TValue, TValue> updateValueFactory,
+            TimeSpan ttl)
+        {
+            _dict.AddOrUpdate(
+                key,
+                k => new TtlValue(addValueFactory(k), ttl),
+                (k, v) => new TtlValue(updateValueFactory(k, v.Value), ttl));
+        }
 
-			if (ttlValue.IsExpired()) //found but expired
-			{
-				var kv = new KeyValuePair<TKey, TtlValue>(key, ttlValue);
+        public bool TryGet(TKey key, out TValue value)
+        {
+            value = default(TValue);
 
-				//secret atomic removal method (only if both key and value match condition
-				//https://devblogs.microsoft.com/pfxteam/little-known-gems-atomic-conditional-removals-from-concurrentdictionary/
-				//so that we don't need any locks!! woohoo
-				_dict.TryRemove(kv);
+            TtlValue ttlValue;
+            if (!_dict.TryGetValue(key, out ttlValue))
+                return false;
 
-				/* EXPLANATION:
-				 * when an item was "found but is expired" - we need to treat as "not found" and discard it.
-				 * One solution is to use a lock
-				 * so that the three steps "exist? expired? remove!" are performed atomically.
-				 * Otherwise another tread might chip in, and ADD a non-expired item with the same key while we're evicting it.
-				 * And we'll be removing a non-expired key that was just added.
-				 * 
-				 * BUT instead of using locks we can remove by key AND value. So if another thread has just rushed in 
-				 * and added another item with the same key - that other item won't be removed.
-				 * 
-				 * basically, instead of doing this
-				 * 
-				 * lock {
-				 *		exists?
-				 *		expired?
-				 *		remove by key!
-				 * }
-				 * 
-				 * we do this
-				 * 
-				 * exists? (if yes returns the value)
-				 * expired?
-				 * remove by key AND value
-				 * 
-				 * If another thread has modified the value - it won't remove it.
-				 * 
-				 * Locks suck becasue add extra 50ns to benchmark, so it becomes 110ns instead of 70ns which sucks.
-				 * So - no locks then!!!
-				 * 
-				 * */
+            if (ttlValue.IsExpired())
+            {
+                TtlValue existing;
+                if (_dict.TryGetValue(key, out existing) &&
+                    ReferenceEquals(existing, ttlValue))
+                {
+                    _dict.TryRemove(key, out existing);
+                }
 
-				OnEviction(key);
+                OnEviction(key);
+                return false;
+            }
 
-				return false;
-			}
+            value = ttlValue.Value;
+            return true;
+        }
 
-			value = ttlValue.Value;
-			return true;
-		}
+        public bool TryAdd(TKey key, TValue value, TimeSpan ttl)
+        {
+            TValue dummy;
+            if (TryGet(key, out dummy))
+                return false;
 
-		/// <summary>
-		/// Attempts to add a key/value item
-		/// </summary>
-		/// <param name="key">The key to add</param>
-		/// <param name="value">The value to add</param>
-		/// <param name="ttl">TTL of the item</param>
-		/// <returns>True if value was added, otherwise false (already exists)</returns>
-		public bool TryAdd(TKey key, TValue value, TimeSpan ttl)
-		{
-			if (TryGet(key, out _))
-				return false;
+            return _dict.TryAdd(key, new TtlValue(value, ttl));
+        }
 
-			return _dict.TryAdd(key, new TtlValue(value, ttl));
-		}
+        private TValue GetOrAddCore(
+            TKey key,
+            Func<TValue> valueFactory,
+            TimeSpan ttl)
+        {
+            bool wasAdded = false;
 
-		private TValue GetOrAddCore(TKey key, Func<TValue> valueFactory, TimeSpan ttl)
-		{
-			bool wasAdded = false; //flag to indicate "add vs get". TODO: wrap in ref type some day to avoid captures/closures
-			var ttlValue = _dict.GetOrAdd(
-				key,
-				(_) =>
-				{
-					wasAdded = true;
-					return new TtlValue(valueFactory(), ttl);
-				});
+            var ttlValue = _dict.GetOrAdd(
+                key,
+                k =>
+                {
+                    wasAdded = true;
+                    return new TtlValue(valueFactory(), ttl);
+                });
 
-			//if the item is expired, update value and TTL
-			//since TtlValue is a reference type we can update its properties in-place, instead of removing and re-adding to the dictionary (extra lookups)
-			if (!wasAdded) //performance hack: skip expiration check if a brand item was just added
-			{
-				if (ttlValue.ModifyIfExpired(valueFactory, ttl))
-					OnEviction(key);
-			}
+            if (!wasAdded)
+            {
+                if (ttlValue.ModifyIfExpired(valueFactory, ttl))
+                    OnEviction(key);
+            }
 
-			return ttlValue.Value;
-		}
+            return ttlValue.Value;
+        }
 
-		/// <summary>
-		/// Adds a key/value pair by using the specified function if the key does not already exist, or returns the existing value if the key exists.
-		/// </summary>
-		/// <param name="key">The key to add</param>
-		/// <param name="valueFactory">The factory function used to generate the item for the key</param>
-		/// <param name="ttl">TTL of the item</param>
-		public TValue GetOrAdd(TKey key, Func<TKey, TValue> valueFactory, TimeSpan ttl)
-			=> GetOrAddCore(key, () => valueFactory(key), ttl);
+        public TValue GetOrAdd(
+            TKey key,
+            Func<TKey, TValue> valueFactory,
+            TimeSpan ttl)
+        {
+            return GetOrAddCore(key, () => valueFactory(key), ttl);
+        }
 
-		/// <summary>
-		/// Adds a key/value pair by using the specified function if the key does not already exist, or returns the existing value if the key exists.
-		/// </summary>
-		/// <param name="key">The key to add</param>
-		/// <param name="valueFactory">The factory function used to generate the item for the key</param>
-		/// <param name="ttl">TTL of the item</param>
-		/// <param name="factoryArgument">Argument value to pass into valueFactory</param>
-		public TValue GetOrAdd<TArg>(TKey key, Func<TKey, TArg, TValue> valueFactory, TimeSpan ttl, TArg factoryArgument)
-			=> GetOrAddCore(key, () => valueFactory(key, factoryArgument), ttl);
+        public TValue GetOrAdd<TArg>(
+            TKey key,
+            Func<TKey, TArg, TValue> valueFactory,
+            TimeSpan ttl,
+            TArg arg)
+        {
+            return GetOrAddCore(key, () => valueFactory(key, arg), ttl);
+        }
 
-		/// <summary>
-		/// Adds a key/value pair by using the specified function if the key does not already exist, or returns the existing value if the key exists.
-		/// </summary>
-		/// <param name="key">The key to add</param>
-		/// <param name="value">The value to add</param>
-		/// <param name="ttl">TTL of the item</param>
-		public TValue GetOrAdd(TKey key, TValue value, TimeSpan ttl)
-			=> GetOrAddCore(key, () => value, ttl);
+        public TValue GetOrAdd(
+            TKey key,
+            TValue value,
+            TimeSpan ttl)
+        {
+            return GetOrAddCore(key, () => value, ttl);
+        }
 
-		/// <summary>
-		/// Tries to remove item with the specified key
-		/// </summary>
-		/// <param name="key">The key of the element to remove</param>
-		public void Remove(TKey key)
-		{
-			_dict.TryRemove(key, out _);
-		}
+        public void Remove(TKey key)
+        {
+            TtlValue dummy;
+            _dict.TryRemove(key, out dummy);
+        }
 
-		/// <summary>
-		/// Tries to remove item with the specified key, also returns the object removed in an "out" var
-		/// </summary>
-		/// <param name="key">The key of the element to remove</param>
-		/// <param name="value">Contains the object removed or the default value if not found</param>
-		public bool TryRemove(TKey key, out TValue value)
-		{
-			bool res = _dict.TryRemove(key, out var ttlValue) && !ttlValue.IsExpired();
-			value = res ? ttlValue.Value : default(TValue);
-			return res;
-		}
+        public bool TryRemove(TKey key, out TValue value)
+        {
+            TtlValue ttlValue;
+            bool res = _dict.TryRemove(key, out ttlValue) &&
+                       !ttlValue.IsExpired();
 
-		/// <inheritdoc/>
-		public IEnumerator<KeyValuePair<TKey, TValue>> GetEnumerator()
-		{
-			var currTime = Environment.TickCount64; //save to a var to prevent multiple calls to Environment.TickCount64
-			foreach (var kvp in _dict)
-			{
-				if (!kvp.Value.IsExpired(currTime))
-					yield return new KeyValuePair<TKey, TValue>(kvp.Key, kvp.Value.Value);
-			}
-		}
+            value = res ? ttlValue.Value : default(TValue);
+            return res;
+        }
 
-		IEnumerator IEnumerable.GetEnumerator()
-		{
-			return this.GetEnumerator();
-		}
+        public IEnumerator<KeyValuePair<TKey, TValue>> GetEnumerator()
+        {
+            long now = TimeUtil.NowMs();
 
-		private void OnEviction(TKey key)
-		{
-			if (_itemEvicted == null) return;
+            foreach (var kv in _dict)
+            {
+                if (!kv.Value.IsExpired(now))
+                    yield return new KeyValuePair<TKey, TValue>(
+                        kv.Key, kv.Value.Value);
+            }
+        }
 
-			Task.Run(() => //run on thread pool to avoid blocking
-			{
-				try
-				{
-					_itemEvicted(key);
-				}
-				catch { } //to prevent any exceptions from crashing the thread
-			});
-		}
+        IEnumerator IEnumerable.GetEnumerator()
+        {
+            return GetEnumerator();
+        }
 
-		// same as OnEviction(TKey) but for batching
-		private void OnEviction(List<TKey> keys)
-		{
-			if (keys == null || keys.Count == 0) return;
-			if (_itemEvicted == null) return;
+        private void OnEviction(TKey key)
+        {
+            if (_itemEvicted == null)
+                return;
 
-			Task.Run(() => //run on thread pool to avoid blocking
-			{
-				try
-				{
-					foreach (var key in keys)
-					{
-						_itemEvicted(key);
-					}
-				}
-				catch { } //to prevent any exceptions from crashing the thread
-			});
-		}
+            Task.Run(() =>
+            {
+                try { _itemEvicted(key); }
+                catch { }
+            });
+        }
 
-		private class TtlValue
-		{
-			public TValue Value { get; private set; }
-			private long TickCountWhenToKill;
+        private void OnEviction(List<TKey> keys)
+        {
+            if (keys == null || keys.Count == 0 || _itemEvicted == null)
+                return;
 
-			public TtlValue(TValue value, TimeSpan ttl)
-			{
-				Value = value;
-				TickCountWhenToKill = Environment.TickCount64 + (long)ttl.TotalMilliseconds;
-			}
+            Task.Run(() =>
+            {
+                try
+                {
+                    foreach (var key in keys)
+                        _itemEvicted(key);
+                }
+                catch { }
+            });
+        }
 
-			public bool IsExpired() => IsExpired(Environment.TickCount64);
+        private sealed class TtlValue
+        {
+            public TValue Value { get; private set; }
+            private long _expiresAt;
 
-			//use an overload instead of optional param to avoid extra IF's
-			public bool IsExpired(long currTime) => currTime > TickCountWhenToKill;
+            public TtlValue(TValue value, TimeSpan ttl)
+            {
+                Value = value;
+                _expiresAt = TimeUtil.NowMs() +
+                             (long)ttl.TotalMilliseconds;
+            }
 
-			/// <summary>
-			/// Updates the value and TTL only if the item is expired
-			/// </summary>
-			/// <returns>True if the item expired and was updated, otherwise false</returns>
-			public bool ModifyIfExpired(Func<TValue> newValueFactory, TimeSpan newTtl)
-			{
-				var ticks = Environment.TickCount64; //save to a var to prevent multiple calls to Environment.TickCount64
-				if (IsExpired(ticks)) //if expired - update the value and TTL
-				{
-					TickCountWhenToKill = ticks + (long)newTtl.TotalMilliseconds; //update the expiration time first for better concurrency
-					Value = newValueFactory();
-					return true;
-				}
-				return false;
-			}
-		}
+            public bool IsExpired()
+            {
+                return IsExpired(TimeUtil.NowMs());
+            }
 
-		//IDispisable members
-		private bool _disposedValue;
-		/// <inheritdoc/>
-		public void Dispose() => Dispose(true);
-		/// <inheritdoc/>
-		protected virtual void Dispose(bool disposing)
-		{
-			if (!_disposedValue)
-			{
-				if (disposing)
-				{
-					_cleanUpTimer.Dispose();
-				}
+            public bool IsExpired(long now)
+            {
+                return now > _expiresAt;
+            }
 
-				_disposedValue = true;
-			}
-		}
-	}
+            public bool ModifyIfExpired(
+                Func<TValue> newValueFactory,
+                TimeSpan newTtl)
+            {
+                long now = TimeUtil.NowMs();
+
+                if (IsExpired(now))
+                {
+                    _expiresAt = now +
+                                 (long)newTtl.TotalMilliseconds;
+                    Value = newValueFactory();
+                    return true;
+                }
+
+                return false;
+            }
+        }
+
+        private bool _disposed;
+
+        public void Dispose()
+        {
+            Dispose(true);
+        }
+
+        protected virtual void Dispose(bool disposing)
+        {
+            if (_disposed)
+                return;
+
+            if (disposing)
+                _cleanUpTimer.Dispose();
+
+            _disposed = true;
+        }
+    }
+
+    internal static class TimeUtil
+    {
+        private static readonly double TickToMs =
+            1000.0 / Stopwatch.Frequency;
+
+        public static long NowMs()
+        {
+            return (long)(Stopwatch.GetTimestamp() * TickToMs);
+        }
+    }
 }
